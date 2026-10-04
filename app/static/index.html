@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>机载维护站 · 隔离读卡器升级指令复核</title>
+<style>
+  :root { --ok:#15803d; --bad:#b91c1c; --line:#d4d4d8; --bg:#f4f4f5; --card:#fff; --ink:#18181b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:#1e293b; color:#fff; padding:14px 20px; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; font-weight:600; }
+  #health { margin-left:auto; font-size:13px; display:flex; align-items:center; gap:6px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:#a1a1aa; display:inline-block; }
+  .dot.ok { background:#4ade80; } .dot.bad { background:#f87171; }
+  main { max-width:1180px; margin:18px auto; padding:0 16px 48px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:15px; margin:0 0 12px; }
+  label { font-size:13px; color:#3f3f46; }
+  input[type=text] { font-family:ui-monospace,Consolas,monospace; font-size:13px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; }
+  #auditId { width:280px; }
+  button { font-size:13px; padding:7px 14px; border:1px solid #94a3b8; background:#fff; border-radius:6px; cursor:pointer; }
+  button:hover { background:#f1f5f9; }
+  button.primary { background:#1e293b; color:#fff; border-color:#1e293b; }
+  button.primary:hover { background:#334155; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; }
+  th, td { border:1px solid var(--line); padding:5px 7px; text-align:left; vertical-align:top; }
+  th { background:#f1f5f9; font-weight:600; }
+  .hexin { width:100%; min-width:340px; }
+  .mono { font-family:ui-monospace,Consolas,monospace; font-size:12.5px; word-break:break-all; }
+  .toolbar { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; align-items:center; }
+  .banner { border-radius:8px; padding:12px 16px; font-size:15px; font-weight:600; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .banner.pass { background:#dcfce7; color:var(--ok); border:1px solid #86efac; }
+  .banner.fail { background:#fee2e2; color:var(--bad); border:1px solid #fca5a5; }
+  .chip { font-size:11.5px; font-weight:500; background:#0f172a; color:#fff; border-radius:999px; padding:2px 10px; }
+  .chip.gray { background:#64748b; }
+  .err { background:#fef2f2; border:1px solid #fecaca; border-radius:8px; padding:12px 14px; margin-top:12px; font-size:13.5px; }
+  .err code { background:#fee2e2; padding:1px 5px; border-radius:4px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:860px){ .grid2{grid-template-columns:1fr;} }
+  .apdu { background:#f8fafc; border:1px solid var(--line); border-radius:6px; padding:8px 10px; margin-bottom:6px; }
+  .muted { color:#71717a; font-size:12.5px; }
+  details summary { cursor:pointer; color:#475569; font-size:12px; }
+  pre { background:#0f172a; color:#e2e8f0; padding:10px; border-radius:6px; font-size:11.5px; overflow:auto; margin:6px 0 0; }
+  .wrap { overflow-x:auto; }
+  #frozenList button { margin:2px 4px 2px 0; font-size:12px; padding:4px 9px; }
+  .note { font-size:12px; color:#52525b; margin-top:6px; }
+  .conflict { background:#fef9c3; border:1px solid #fde047; color:#854d0e; border-radius:8px; padding:10px 14px; margin-bottom:12px; font-size:13.5px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>机载维护站 · 隔离读卡器升级指令复核（T=1 捕获审计）</h1>
+  <span id="health"><span class="dot" id="healthDot"></span><span id="healthText">健康检查…</span></span>
+</header>
+<main>
+  <div class="card">
+    <h2>捕获录入（按捕获顺序，最多 64 块）</h2>
+    <div class="toolbar">
+      <label>审计标识 <input type="text" id="auditId" placeholder="如 AUD-2026-0001" maxlength="128"></label>
+      <button class="primary" onclick="submitAudit()">提交复核（冻结）</button>
+      <button onclick="loadAudit()">读取已冻结结果</button>
+    </div>
+    <div class="toolbar">
+      <button onclick="addRow()">＋添加块</button>
+      <button onclick="clearRows()">清空</button>
+      <button onclick="fillExample('retx')">示例：合法重传</button>
+      <button onclick="fillExample('wtx')">示例：WTX往返</button>
+      <button onclick="fillExample('wtxbad')">示例：非法等待扩展</button>
+      <span class="muted" id="rowCount"></span>
+    </div>
+    <div class="wrap">
+    <table id="blocksTable">
+      <thead><tr><th style="width:44px">#</th><th style="width:150px">方向</th><th>十六进制原始块（NAD PCB LEN INF LRC）</th><th style="width:56px"></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    </div>
+    <div class="note">TX＝维护站→读卡器，RX＝读卡器→维护站。提交即冻结：相同标识重传相同捕获返回原结果；改动任一块将冲突（409），原结果仍可读取。</div>
+  </div>
+
+  <div class="card" id="frozenCard">
+    <h2>已冻结审计</h2>
+    <div id="frozenList"><span class="muted">加载中…</span></div>
+  </div>
+
+  <div id="resultArea" style="display:none">
+    <div class="conflict" id="conflictBanner"></div>
+    <div class="card">
+      <h2>冻结裁决</h2>
+      <div id="verdictBox"></div>
+      <div id="errorBox"></div>
+    </div>
+    <div class="card">
+      <h2>完整 APDU（链式组装输出）</h2>
+      <div class="grid2">
+        <div><h3 style="font-size:13px;margin:0 0 8px">TX · 站→读卡器</h3><div id="apduTx"></div></div>
+        <div><h3 style="font-size:13px;margin:0 0 8px">RX · 读卡器→站</h3><div id="apduRx"></div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>逐步明细（序号 / 动作 / 重传依据 / 状态快照）</h2>
+      <div class="wrap"><table id="stepsTable">
+        <thead><tr>
+          <th>#</th><th>方向</th><th>类型</th><th>序号</th><th>原始块</th><th>动作</th><th>重传依据 / 备注</th><th>状态快照</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+    <div class="card">
+      <h2>最终状态快照</h2>
+      <pre id="finalState"></pre>
+    </div>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const DIR_LABEL = { TX: "TX 站→读卡器", RX: "RX 读卡器→站" };
+const ACTION_LABEL = {
+  "chain-segment": "链式段缓存",
+  "apdu-complete": "APDU 组装完成",
+  "retransmission": "合法重传（不重复拼接）",
+  "ack": "R(ACK) 确认",
+  "nak": "R(NAK) 请求重传",
+  "ifs-request": "S(IFS) 请求",
+  "ifs-response": "S(IFS) 应答匹配",
+  "wtx-request": "S(WTX) 请求（等待扩展）",
+  "wtx-response": "S(WTX) 应答匹配",
+};
+
+function mkBlock(nad, pcb, infHex) {
+  const inf = (infHex || "").replace(/\s+/g, "");
+  const bytes = [nad, pcb, inf.length / 2];
+  for (let i = 0; i < inf.length; i += 2) bytes.push(parseInt(inf.substr(i, 2), 16));
+  let lrc = 0; for (const b of bytes) lrc ^= b;
+  bytes.push(lrc);
+  return bytes.map(b => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+
+function addRow(dir, hex) {
+  const tb = document.querySelector("#blocksTable tbody");
+  if (tb.rows.length >= 64) { alert("最多 64 块"); return; }
+  const tr = tb.insertRow();
+  const i = tb.rows.length - 1;
+  tr.innerHTML =
+    `<td class="idx">${i}</td>` +
+    `<td><select><option value="TX"${dir === "TX" ? " selected" : ""}>TX 站→读卡器</option>` +
+    `<option value="RX"${dir === "RX" ? " selected" : ""}>RX 读卡器→站</option></select></td>` +
+    `<td><input type="text" class="hexin" spellcheck="false" value="${hex || ""}" placeholder="如 1200 00 …"></td>` +
+    `<td><button onclick="delRow(this)">删</button></td>`;
+  updateCount();
+}
+function delRow(btn) {
+  btn.closest("tr").remove();
+  document.querySelectorAll("#blocksTable tbody .idx").forEach((c, i) => c.textContent = i);
+  updateCount();
+}
+function clearRows() { document.querySelector("#blocksTable tbody").innerHTML = ""; updateCount(); }
+function updateCount() { $("rowCount").textContent = `已录入 ${document.querySelector("#blocksTable tbody").rows.length}/64 块`; }
+
+function fillExample(kind) {
+  clearRows();
+  const T = 0x12, R = 0x21; // NAD：TX=0x12，RX=0x21（半字节互换）
+  const rows = [];
+  if (kind === "retx") {
+    rows.push(["TX", mkBlock(T, 0x20, "00A4040007")]);          // I N(S)=0 M=1
+    rows.push(["RX", mkBlock(R, 0x90, "")]);                    // R(ACK) N(R)=1
+    rows.push(["TX", mkBlock(T, 0x40, "A0000000031010")]);      // I N(S)=1 M=0 → APDU完成
+    rows.push(["RX", mkBlock(R, 0x00, "6F0584039000")]);        // I N(S)=0
+    rows.push(["RX", mkBlock(R, 0x00, "6F0584039000")]);        // 合法重复
+    rows.push(["TX", mkBlock(T, 0x90, "")]);                    // R(ACK) N(R)=1
+    $("auditId").value = $("auditId").value || "DEMO-RETX-OK";
+  } else if (kind === "wtx") {
+    rows.push(["TX", mkBlock(T, 0x00, "00A4040000")]);          // I N(S)=0
+    rows.push(["RX", mkBlock(R, 0xC3, "05")]);                  // S(WTX) 请求 倍率5
+    rows.push(["TX", mkBlock(T, 0xE3, "05")]);                  // S(WTX) 应答 倍率5
+    rows.push(["RX", mkBlock(R, 0x00, "9000")]);                // 继续处理
+    $("auditId").value = $("auditId").value || "DEMO-WTX-OK";
+  } else {
+    rows.push(["TX", mkBlock(T, 0x00, "00A4040000")]);          // I N(S)=0
+    rows.push(["RX", mkBlock(R, 0xC3, "05")]);                  // S(WTX) 请求
+    rows.push(["TX", mkBlock(T, 0x40, "00A4040000")]);          // 等待期间收到I块 → 违规
+    $("auditId").value = $("auditId").value || "DEMO-WTX-BAD";
+  }
+  rows.forEach(([d, h]) => addRow(d, h));
+}
+
+function collectBlocks() {
+  const rows = [...document.querySelectorAll("#blocksTable tbody tr")];
+  const blocks = [];
+  for (let i = 0; i < rows.length; i++) {
+    const direction = rows[i].querySelector("select").value;
+    const hex = rows[i].querySelector("input").value.trim();
+    if (!hex) throw `第 ${i} 块为空`;
+    const compact = hex.replace(/\s+/g, "");
+    if (!/^[0-9A-Fa-f]*$/.test(compact) || compact.length % 2) throw `第 ${i} 块不是合法十六进制`;
+    blocks.push({ direction, hex: compact.toUpperCase() });
+  }
+  if (!blocks.length) throw "请至少录入 1 块";
+  if (blocks.length > 64) throw "最多 64 块";
+  return blocks;
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let body = null;
+  try { body = await r.json(); } catch (e) { /* 忽略 */ }
+  return { status: r.status, body };
+}
+
+async function submitAudit() {
+  $("conflictBanner").style.display = "none";
+  let blocks;
+  try { blocks = collectBlocks(); } catch (e) { alert(e); return; }
+  const auditId = $("auditId").value.trim();
+  if (!auditId) { alert("请填写审计标识"); return; }
+  const { status, body } = await api("/api/audits", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ audit_id: auditId, blocks }),
+  });
+  if (status === 409) {
+    const cb = $("conflictBanner");
+    cb.textContent = `冲突（409）：${body && body.message || "审计标识已冻结且捕获不一致"}。以下展示原冻结结果。`;
+    cb.style.display = "block";
+    return loadAudit(true);
+  }
+  if (status !== 200 && status !== 201) { alert(`提交失败（${status}）：${body && body.message || "未知错误"}`); return; }
+  renderResult(body);
+  refreshFrozen();
+}
+
+async function loadAudit(keepConflict) {
+  if (!keepConflict) $("conflictBanner").style.display = "none";
+  const auditId = $("auditId").value.trim();
+  if (!auditId) { alert("请填写审计标识"); return; }
+  const { status, body } = await api("/api/audits/" + encodeURIComponent(auditId));
+  if (status === 404) { alert("未找到该审计标识的冻结结果"); return; }
+  if (status !== 200) { alert(`读取失败（${status}）`); return; }
+  renderResult(body);
+}
+
+function seqText(s) {
+  if (s.kind === "I") return `N(S)=${s.ns} M=${s.more}`;
+  if (s.kind === "R") return `N(R)=${s.nr} ${["ACK","NAK-EDC","NAK-OTHER"][s.rcode] || s.rcode}`;
+  return `${s.stype}${s.sresp ? " 应答" : " 请求"}`;
+}
+
+function renderResult(r) {
+  $("resultArea").style.display = "block";
+  const pass = r.verdict === "PASS";
+  $("verdictBox").innerHTML =
+    `<div class="banner ${pass ? "pass" : "fail"}">` +
+    `<span>冻结裁决：${pass ? "通过 PASS" : "失败 FAIL"}</span>` +
+    `<span class="chip">已冻结</span>` +
+    (r.replayed ? `<span class="chip gray">相同捕获重传 · 返回原结果</span>` : "") +
+    `<span class="muted">审计标识 ${r.audit_id} · ${r.block_count} 块 · ${r.created_at || ""}</span></div>`;
+  if (r.error) {
+    const e = r.error;
+    $("errorBox").innerHTML =
+      `<div class="err"><b>首个违规原始块 #${e.index}</b>（${DIR_LABEL[e.direction] || e.direction}）` +
+      ` · 错误码 <code>${e.code}</code><br>${e.message}<br><span class="mono">${e.raw}</span></div>`;
+  } else {
+    $("errorBox").innerHTML = "";
+  }
+  const apduHtml = list => list.length
+    ? list.map((a, i) => `<div class="apdu mono"><b>APDU#${i}</b>（${a.length / 2}字节）<br>${a}</div>`).join("")
+    : `<span class="muted">（无完整 APDU）</span>`;
+  $("apduTx").innerHTML = apduHtml(r.apdus.TX);
+  $("apduRx").innerHTML = apduHtml(r.apdus.RX);
+  const tb = document.querySelector("#stepsTable tbody");
+  tb.innerHTML = "";
+  for (const s of r.steps) {
+    const notes = [s.basis, ...(s.notes || [])].filter(Boolean).join("<br>") || "—";
+    const tr = tb.insertRow();
+    tr.innerHTML =
+      `<td>${s.index}</td><td>${DIR_LABEL[s.direction] || s.direction}</td><td>${s.kind} 块</td>` +
+      `<td>${seqText(s)}</td><td class="mono">${s.raw}</td>` +
+      `<td>${ACTION_LABEL[s.action] || s.action}</td><td>${notes}</td>` +
+      `<td><details><summary>快照</summary><pre>${JSON.stringify(s.state, null, 1)}</pre></details></td>`;
+  }
+  $("finalState").textContent = JSON.stringify(r.final_state, null, 2);
+  $("resultArea").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function refreshHealth() {
+  try {
+    const { status, body } = await api("/health");
+    const ok = status === 200 && body && body.status === "ok";
+    $("healthDot").className = "dot " + (ok ? "ok" : "bad");
+    $("healthText").textContent = ok ? `健康 · 已冻结 ${body.audits} 项` : "健康检查异常";
+  } catch (e) {
+    $("healthDot").className = "dot bad";
+    $("healthText").textContent = "服务不可达";
+  }
+}
+
+async function refreshFrozen() {
+  try {
+    const { status, body } = await api("/api/audits");
+    if (status !== 200) throw 0;
+    $("frozenList").innerHTML = body.audits.length
+      ? body.audits.map(a =>
+          `<button onclick="document.getElementById('auditId').value='${a.audit_id}';loadAudit()">` +
+          `${a.audit_id} · ${a.verdict} · ${a.block_count}块</button>`).join("")
+      : `<span class="muted">（暂无）</span>`;
+  } catch (e) {
+    $("frozenList").innerHTML = `<span class="muted">读取失败</span>`;
+  }
+}
+
+addRow("TX", ""); addRow("RX", "");
+refreshHealth(); refreshFrozen();
+setInterval(refreshHealth, 15000);
+</script>
+</body>
+</html>

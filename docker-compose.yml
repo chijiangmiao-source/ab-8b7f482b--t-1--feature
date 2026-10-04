@@ -1,0 +1,23 @@
+# 机载维护站 · 隔离读卡器升级指令复核（T=1 捕获审计）
+#
+# 用法：
+#   运行服务：  docker compose up app
+#   执行验收：  docker compose run --rm verify
+#               （verify 执行代码测试、构建检查、API/HTTP 冒烟后退出，
+#                 退出码即验收结果：0=通过，非0=失败）
+services:
+  app:
+    build: .
+    image: t1-audit:latest
+    environment:
+      PORT: "8080"          # 可配置端口
+      # STORE_PATH: /data/audits.json   # 可选：冻结结果持久化
+    ports:
+      - "8080:8080"
+
+  verify:
+    build: .
+    image: t1-audit:latest
+    entrypoint: ["/app/scripts/verify.sh"]
+    environment:
+      VERIFY_PORT: "18080"  # 冒烟用内部端口
