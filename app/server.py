@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
+from .roundtrip import build_roundtrips
 from .store import AuditStore
 from .t1proto import DIRECTIONS, MAX_BLOCKS, Engine
 
@@ -71,12 +72,33 @@ def make_handler(store, static_dir):
             if path == "/api/audits":
                 return self._json(200, {"audits": store.list()})
             if path.startswith("/api/audits/"):
-                audit_id = unquote(path[len("/api/audits/"):])
+                rest = path[len("/api/audits/"):]
+                if rest.endswith("/roundtrips"):
+                    return self._serve_roundtrips(unquote(rest[:-len("/roundtrips")]))
+                audit_id = unquote(rest)
                 result = store.get(audit_id)
                 if result is None:
                     return self._json(404, {"error": "not_found", "audit_id": audit_id})
                 return self._json(200, result)
             return self._json(404, {"error": "not_found"})
+
+        def _serve_roundtrips(self, audit_id):
+            """只读派生：在冻结结果之上生成命令—应答往返证据，不改写冻结内容。"""
+            result = store.get(audit_id)
+            if result is None:
+                return self._json(404, {"error": "not_found", "audit_id": audit_id})
+            if result.get("verdict") != "PASS":
+                return self._json(400, {
+                    "error": "not_a_pass_audit",
+                    "audit_id": audit_id,
+                    "message": "往返证据仅对已冻结且通过(PASS)的审计生成",
+                })
+            evidence = build_roundtrips(result)
+            return self._json(200, {
+                "audit_id": audit_id,
+                "frozen": True,
+                **evidence,
+            })
 
         def _serve_page(self):
             page = os.path.join(static_dir, "index.html")

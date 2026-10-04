@@ -117,6 +117,56 @@ def main():
                  {"audit_id": RUN_ID + "-65", "blocks": [{"direction": "TX", "hex": blk(T, 0x00, "00")}] * 65})
     check("超过64块 → 400", st7 == 400, f"status={st7}")
 
+    # 10. 往返证据：合法重传捕获 → 1 对，应答只贡献一次（#3），重传块 #4 不入首末序号
+    st8, body8 = req("GET", f"/api/audits/{RUN_ID}/roundtrips")
+    ok8 = (st8 == 200 and body8.get("summary") ==
+           {"commands": 1, "answered": 1, "unanswered": 0, "unassignable": 0}
+           and body8["pairs"][0]["response"]["first_index"] == 3
+           and body8["pairs"][0]["response"]["last_index"] == 3
+           and body8.get("unassigned") == [])
+    check("GET 往返证据 → 命令—应答配对且重传只贡献一次 APDU", ok8, f"status={st8} body={body8}")
+
+    # 11. 往返证据：未应答捕获 → 命令0 标为未应答（下一条命令开始前无应答）
+    noans = [
+        {"direction": "TX", "hex": blk(T, 0x00, "00A4040000")},
+        {"direction": "RX", "hex": blk(R, 0x90)},
+        {"direction": "TX", "hex": blk(T, 0x40, "00B000000A")},
+        {"direction": "RX", "hex": blk(R, 0x00, "9000")},
+    ]
+    req("POST", "/api/audits", {"audit_id": RUN_ID + "-noans", "blocks": noans})
+    st9, body9 = req("GET", f"/api/audits/{RUN_ID}-noans/roundtrips")
+    ok9 = (st9 == 200 and body9["pairs"][0]["status"] == "unanswered"
+           and body9["pairs"][0]["reason"] == "NEXT_COMMAND"
+           and body9["pairs"][1]["response"]["apdu"] == "9000"
+           and body9["summary"]["unanswered"] == 1)
+    check("下一条命令前无应答 → 该命令标为未应答", ok9, f"status={st9} body={body9}")
+
+    # 12. 往返证据：读卡器先发 APDU → 标记首个无法归属且不借给后续命令
+    first = [
+        {"direction": "RX", "hex": blk(R, 0x00, "3B00")},
+        {"direction": "TX", "hex": blk(T, 0x00, "00A4040000")},
+        {"direction": "RX", "hex": blk(R, 0x40, "9000")},
+    ]
+    req("POST", "/api/audits", {"audit_id": RUN_ID + "-first", "blocks": first})
+    st10, body10 = req("GET", f"/api/audits/{RUN_ID}-first/roundtrips")
+    f1 = body10.get("first_unassignable") or {}
+    ok10 = (st10 == 200 and f1.get("apdu") == "3B00" and f1.get("first_index") == 0
+            and f1.get("reason") == "READER_FIRST"
+            and body10["pairs"][0]["response"]["apdu"] == "9000"
+            and len(body10.get("unassigned", [])) == 1)
+    check("读卡器先发 APDU → 首个无法归属且不转借", ok10, f"status={st10} body={body10}")
+
+    # 13. 往返证据：FAIL 审计 → 400；未知标识 → 404；冻结结果不含派生字段
+    st11, body11 = req("GET", f"/api/audits/{RUN_ID}-wtx/roundtrips")
+    check("FAIL 审计往返证据 → 400", st11 == 400 and body11.get("error") == "not_a_pass_audit",
+          f"status={st11}")
+    st12, _ = req("GET", f"/api/audits/{RUN_ID}-missing/roundtrips")
+    check("未知审计往返证据 → 404", st12 == 404, f"status={st12}")
+    st13, frozen = req("GET", f"/api/audits/{RUN_ID}")
+    check("派生往返证据不改写冻结结果",
+          st13 == 200 and "pairs" not in frozen and "roundtrips" not in frozen,
+          f"status={st13}")
+
     print()
     if FAILURES:
         print(f"SMOKE FAIL：{len(FAILURES)} 项未通过：{', '.join(FAILURES)}")

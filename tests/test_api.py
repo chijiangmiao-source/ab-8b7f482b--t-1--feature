@@ -35,6 +35,21 @@ WTX_BAD_CAPTURE = [
     {"direction": "TX", "hex": blk(NAD_TX, 0x40, "00A4040000")},
 ]
 
+# 未应答捕获：命令0 仅获链路层 ACK，命令1 开始后才出现读卡器 APDU
+UNANSWERED_CAPTURE = [
+    {"direction": "TX", "hex": blk(NAD_TX, 0x00, "00A4040000")},   # #0 命令0
+    {"direction": "RX", "hex": blk(NAD_RX, 0x90)},                 # #1 R(ACK)
+    {"direction": "TX", "hex": blk(NAD_TX, 0x40, "00B000000A")},   # #2 命令1
+    {"direction": "RX", "hex": blk(NAD_RX, 0x00, "9000")},         # #3 应答1
+]
+
+# 抢先 APDU 捕获：读卡器先发出一个无主 APDU
+READER_FIRST_CAPTURE = [
+    {"direction": "RX", "hex": blk(NAD_RX, 0x00, "3B00")},         # #0 无主 APDU
+    {"direction": "TX", "hex": blk(NAD_TX, 0x00, "00A4040000")},   # #1 命令0
+    {"direction": "RX", "hex": blk(NAD_RX, 0x40, "9000")},         # #2 应答0
+]
+
 
 class ApiTestCase(unittest.TestCase):
     @classmethod
@@ -125,6 +140,94 @@ class TestFrozenAudit(ApiTestCase):
         self.assertEqual(status, 200)
         ids = [a["audit_id"] for a in body["audits"]]
         self.assertIn("T-LIST-1", ids)
+
+
+class TestRoundtrips(ApiTestCase):
+    def test_roundtrips_for_frozen_pass_audit(self):
+        self.post("T-RT-LEGAL", LEGAL_CAPTURE)
+        status, body = self.req("GET", "/api/audits/T-RT-LEGAL/roundtrips")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["frozen"])
+        self.assertEqual(body["summary"],
+                         {"commands": 1, "answered": 1, "unanswered": 0, "unassignable": 0})
+        pair = body["pairs"][0]
+        self.assertEqual(pair["status"], "answered")
+        self.assertEqual(pair["command"]["apdu"], "00A4040007A0000000031010")
+        self.assertEqual((pair["command"]["first_index"], pair["command"]["last_index"]), (0, 2))
+        # 合法重复块 #4 不贡献第二个应答 APDU；应答首末块均为 #3
+        self.assertEqual(pair["response"]["apdu"], "6F0584039000")
+        self.assertEqual((pair["response"]["first_index"],
+                          pair["response"]["last_index"]), (3, 3))
+        self.assertEqual(body["unassigned"], [])
+        self.assertIsNone(body["first_unassignable"])
+
+    def test_roundtrips_unanswered_command_marked(self):
+        self.post("T-RT-NOANS", UNANSWERED_CAPTURE)
+        status, body = self.req("GET", "/api/audits/T-RT-NOANS/roundtrips")
+        self.assertEqual(status, 200)
+        p0, p1 = body["pairs"]
+        self.assertEqual(p0["status"], "unanswered")
+        self.assertEqual(p0["reason"], "NEXT_COMMAND")
+        self.assertIsNone(p0["response"])
+        # 命令结束到下一条命令开始之间仅有 R(ACK)，不构成应答；且不属于
+        # “命令结束→应答开始”窗口，故 between 为空
+        self.assertEqual(p0["between"], [])
+        self.assertEqual(p1["status"], "answered")
+        self.assertEqual(p1["response"]["apdu"], "9000")
+        self.assertEqual(body["summary"]["unanswered"], 1)
+
+    def test_roundtrips_reader_first_marked_and_not_lent(self):
+        self.post("T-RT-FIRST", READER_FIRST_CAPTURE)
+        status, body = self.req("GET", "/api/audits/T-RT-FIRST/roundtrips")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["pairs"]), 1)
+        self.assertEqual(body["pairs"][0]["response"]["apdu"], "9000")
+        self.assertEqual(len(body["unassigned"]), 1)
+        first = body["first_unassignable"]
+        self.assertEqual(first["apdu"], "3B00")
+        self.assertEqual(first["first_index"], 0)
+        self.assertEqual(first["reason"], "READER_FIRST")
+
+    def test_roundtrips_wtx_between_command_and_response(self):
+        capture = [
+            {"direction": "TX", "hex": blk(NAD_TX, 0x00, "00A4040000")},
+            {"direction": "RX", "hex": blk(NAD_RX, 0xC3, "05")},
+            {"direction": "TX", "hex": blk(NAD_TX, 0xE3, "05")},
+            {"direction": "RX", "hex": blk(NAD_RX, 0x00, "9000")},
+        ]
+        self.post("T-RT-WTX", capture)
+        status, body = self.req("GET", "/api/audits/T-RT-WTX/roundtrips")
+        self.assertEqual(status, 200)
+        pair = body["pairs"][0]
+        self.assertEqual(pair["status"], "answered")
+        self.assertEqual([c["index"] for c in pair["between"]], [1, 2])
+        self.assertTrue(all(c["kind"] == "S" for c in pair["between"]))
+
+    def test_roundtrips_unknown_404(self):
+        status, body = self.req("GET", "/api/audits/NO-SUCH/roundtrips")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "not_found")
+
+    def test_roundtrips_fail_audit_400_but_frozen_result_unchanged(self):
+        self.post("T-RT-FAIL", WTX_BAD_CAPTURE)
+        status, body = self.req("GET", "/api/audits/T-RT-FAIL/roundtrips")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "not_a_pass_audit")
+        # 原冻结裁决仍可读取且未被改写
+        status2, frozen = self.req("GET", "/api/audits/T-RT-FAIL")
+        self.assertEqual(status2, 200)
+        self.assertEqual(frozen["verdict"], "FAIL")
+        self.assertEqual(frozen["error"]["code"], "S_WAIT")
+        self.assertNotIn("pairs", frozen)
+
+    def test_roundtrips_derivation_does_not_mutate_frozen_result(self):
+        self.post("T-RT-IMMUT", LEGAL_CAPTURE)
+        s1, frozen1 = self.req("GET", "/api/audits/T-RT-IMMUT")
+        self.req("GET", "/api/audits/T-RT-IMMUT/roundtrips")
+        self.req("GET", "/api/audits/T-RT-IMMUT/roundtrips")
+        s2, frozen2 = self.req("GET", "/api/audits/T-RT-IMMUT")
+        self.assertEqual((s1, s2), (200, 200))
+        self.assertEqual(frozen1, frozen2)
 
 
 class TestVerdicts(ApiTestCase):

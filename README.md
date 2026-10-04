@@ -28,6 +28,24 @@
 | POST | `/api/audits` | 提交 `{audit_id, blocks:[{direction,hex}]}` → 201 冻结 / 200 重放 / 409 冲突 / 400 校验失败 |
 | GET | `/api/audits` | 已冻结审计列表 |
 | GET | `/api/audits/{id}` | 读取冻结结果（404 未知） |
+| GET | `/api/audits/{id}/roundtrips` | 只读派生的**往返证据**（仅 PASS；FAIL→400，未知→404），不改动冻结结果 |
+
+### 往返证据（命令—应答对）
+
+审查员选择一份**已冻结且通过**的审计后，系统在冻结裁决之上按**已确认的 I 块链边界**
+（新接受 I 块围成的完整 APDU；合法重传不贡献）派生命令—应答对，逐对返回：
+
+- `command`/`response`：两侧 APDU 十六进制及各自**首、末原始块序号**；
+- `between`：命令结束块到应答首块之间严格穿插的 **R/S 控制块**（序号/方向/标签/原文）；
+  WTX 或 IFS 往返、链路层 R(ACK) 可出现在此而不改变配对；
+- 读卡器在**下一条维护站命令首块开始前**未完成应答时，该命令 `status="unanswered"`
+  （`reason`：`NEXT_COMMAND`/`CAPTURE_END`）；
+- 读卡器**先发 APDU**、连续出现第二个 APDU（`EXTRA_RESPONSE`）、或应答链跨下一条命令
+  边界才完成（`LATE_RESPONSE`）时，该 APDU 进入 `unassigned` 并在 `first_unassignable`
+  中**稳定标出首个**，绝不借给后续命令。
+
+该派生不重新裁决任何块：提交、冻结重放（200 `replayed`）、冲突（409）与逐块裁决结果
+（verdict/error/steps/apdus/final_state）均保持不变。
 
 方向：`TX`=维护站→读卡器，`RX`=读卡器→维护站。块数 1..64。
 
@@ -54,6 +72,7 @@ verify 依次执行：
 1. **代码测试**：`python3 -m unittest discover -s tests -v`
    覆盖合法重传（不重复拼接 APDU）、非法等待扩展（方向/类型/倍率不符、等待期 I 块、
    无请求应答、请求未应答）、冻结审计（重放/冲突/原结果可读）及 LRC/序号/R 块/INF 定位；
+   另覆盖往返配对（首末块序号、穿插 R/S、未应答、连续/抢先读卡器 APDU 稳定标出且不转借）；
 2. **构建检查**：`py_compile` 全部模块 + 导入检查；
 3. **API/HTTP 冒烟**：真实启动服务（`VERIFY_PORT`，默认 18080），
    经 `/health`、页面、提交/重放/冲突/读取/404/上限 逐项检查。
@@ -64,6 +83,7 @@ verify 依次执行：
 
 ```
 app/t1proto.py    T=1 协议引擎（状态机 + 首错定位）
+app/roundtrip.py 往返证据派生（只读：命令—应答对/未应答/无法归属）
 app/server.py     HTTP 服务（API + 页面 + 健康，PORT 可配）
 app/store.py      冻结存储（指纹比对，可选 JSON 持久化）
 app/static/index.html  复核页面
