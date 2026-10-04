@@ -10,11 +10,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
 from .store import AuditStore
-from .t1proto import DIRECTIONS, MAX_BLOCKS, Engine
+from .t1proto import DIRECTIONS, MAX_BLOCKS, Engine, build_roundtrips
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 AUDIT_ID_RE = re.compile(r"^[^\s/]{1,128}$")
 MAX_BODY = 1 << 20  # 1 MiB
+
+
+def with_roundtrips(result):
+    """返回含往返证据的结果副本。
+
+    新提交的结果已由引擎生成 roundtrips；功能上线前冻结的旧结果缺该字段，
+    读取时按其已冻结的 steps/apdus 只读补算，不写回存储（冻结内容不变）。
+    """
+    if "roundtrips" in result:
+        return result
+    apdus = result.get("apdus") or {}
+    enriched = dict(result)
+    enriched["roundtrips"] = build_roundtrips(
+        result.get("steps") or [],
+        {d: apdus.get(d, []) for d in DIRECTIONS},
+    )
+    return enriched
 
 
 def validate_payload(payload):
@@ -75,7 +92,7 @@ def make_handler(store, static_dir):
                 result = store.get(audit_id)
                 if result is None:
                     return self._json(404, {"error": "not_found", "audit_id": audit_id})
-                return self._json(200, result)
+                return self._json(200, with_roundtrips(result))
             return self._json(404, {"error": "not_found"})
 
         def _serve_page(self):
@@ -127,7 +144,7 @@ def make_handler(store, static_dir):
                     "message": "审计标识已冻结且捕获内容不一致，原冻结结果保持不变",
                 })
             if replayed:
-                return self._json(200, {**stored, "replayed": True})
+                return self._json(200, {**with_roundtrips(stored), "replayed": True})
             return self._json(201, stored)
 
     return Handler

@@ -127,6 +127,98 @@ class TestFrozenAudit(ApiTestCase):
         self.assertIn("T-LIST-1", ids)
 
 
+class TestRoundtripEvidence(ApiTestCase):
+    def _capture(self, rows):
+        return [{"direction": d, "hex": h} for d, h in rows]
+
+    def test_submit_and_get_include_roundtrip_pairs(self):
+        capture = self._capture([
+            ("TX", blk(NAD_TX, 0x00, "00A4040000")),
+            ("RX", blk(NAD_RX, 0x00, "9000")),
+        ])
+        status, body = self.post("T-RT-1", capture)
+        self.assertEqual(status, 201)
+        rt = body["roundtrips"]
+        self.assertEqual(rt["command_count"], 1)
+        self.assertEqual(rt["answered_count"], 1)
+        (p,) = rt["pairs"]
+        self.assertEqual(p["status"], "answered")
+        self.assertEqual(p["command"]["apdu"], "00A4040000")
+        self.assertEqual(p["response"]["apdu"], "9000")
+        # GET 同样带往返证据
+        status2, got = self.req("GET", "/api/audits/T-RT-1")
+        self.assertEqual(status2, 200)
+        self.assertEqual(got["roundtrips"], rt)
+
+    def test_wtx_between_apdus_listed_as_control_without_changing_pair(self):
+        capture = self._capture([
+            ("TX", blk(NAD_TX, 0x00, "00A4040000")),
+            ("RX", blk(NAD_RX, 0xC3, "05")),          # WTX 请求
+            ("TX", blk(NAD_TX, 0xE3, "05")),          # WTX 应答
+            ("RX", blk(NAD_RX, 0x00, "9000")),
+        ])
+        _, body = self.post("T-RT-WTX", capture)
+        (p,) = body["roundtrips"]["pairs"]
+        self.assertEqual(p["status"], "answered")
+        self.assertEqual([c["index"] for c in p["between_controls"]], [1, 2])
+        self.assertIn("WTX", p["between_controls"][0]["detail"])
+
+    def test_unanswered_and_orphan_marked(self):
+        # 命令1 → 应答1；R(ACK)；读卡器多余 APDU；命令2（捕获结束前无窗口内应答）
+        capture = self._capture([
+            ("TX", blk(NAD_TX, 0x00, "00A4040000")),
+            ("RX", blk(NAD_RX, 0x00, "6100")),
+            ("TX", blk(NAD_TX, 0x90)),
+            ("RX", blk(NAD_RX, 0x40, "0090")),
+            ("TX", blk(NAD_TX, 0x40, "00B0000000")),
+        ])
+        _, body = self.post("T-RT-ORPHAN", capture)
+        rt = body["roundtrips"]
+        self.assertEqual(rt["answered_count"], 1)
+        self.assertEqual(rt["unanswered_count"], 1)
+        self.assertEqual(rt["pairs"][1]["status"], "unanswered")
+        self.assertIsNone(rt["pairs"][1]["response"])
+        orphan = rt["orphan_response"]
+        self.assertEqual(orphan["apdu"], "0090")
+        self.assertEqual((orphan["first_index"], orphan["last_index"]), (3, 3))
+
+    def test_replay_returns_roundtrips(self):
+        self.post("T-RT-REPLAY", LEGAL_CAPTURE)
+        status, body = self.post("T-RT-REPLAY", LEGAL_CAPTURE)
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("replayed"))
+        self.assertIn("roundtrips", body)
+
+    def test_legacy_frozen_result_enriched_on_read_without_mutation(self):
+        # 先取得一份新结果的 steps/apdus/final_state，模拟功能上线前冻结的旧形态
+        _, fresh = self.post("T-RT-LEGACY-SRC", LEGAL_CAPTURE)
+        legacy_result = {
+            "audit_id": "OLD-1", "frozen": True, "block_count": 6,
+            "verdict": "PASS", "error": None,
+            "steps": fresh["steps"], "apdus": fresh["apdus"],
+            "final_state": fresh["final_state"],
+        }
+        store2 = AuditStore()
+        store2.submit("OLD-1", LEGAL_CAPTURE, legacy_result)  # 无 roundtrips 字段
+        httpd2 = make_server("127.0.0.1", 0, store2)
+        port2 = httpd2.server_address[1]
+        t = threading.Thread(target=httpd2.serve_forever, daemon=True)
+        t.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port2}/api/audits/OLD-1", timeout=5) as r:
+                self.assertEqual(r.status, 200)
+                got = json.loads(r.read())
+            rt = got["roundtrips"]
+            self.assertEqual(rt["answered_count"], 1)
+            self.assertEqual(rt["pairs"][0]["response"]["apdu"], "6F0584039000")
+        finally:
+            httpd2.shutdown()
+            httpd2.server_close()
+        # 补算只发生在读取响应上，存储中的冻结结果本体不被写回改写
+        self.assertNotIn("roundtrips", store2.get("OLD-1"))
+        self.assertEqual(store2.get("OLD-1")["steps"], fresh["steps"])
+
+
 class TestVerdicts(ApiTestCase):
     def test_illegal_waiting_extension_fail_located(self):
         status, body = self.post("T-WTX-BAD", WTX_BAD_CAPTURE)

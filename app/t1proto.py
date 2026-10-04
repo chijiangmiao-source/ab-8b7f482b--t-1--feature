@@ -92,11 +92,13 @@ class Engine:
         return self._result("PASS", None)
 
     def _result(self, verdict, error):
+        apdu_hexes = {d: [a.hex().upper() for a in self.apdus[d]] for d in DIRECTIONS}
         return {
             "verdict": verdict,
             "error": error,
             "steps": self.steps,
-            "apdus": {d: [a.hex().upper() for a in self.apdus[d]] for d in DIRECTIONS},
+            "apdus": apdu_hexes,
+            "roundtrips": build_roundtrips(self.steps, apdu_hexes),
             "final_state": self.snapshot(),
         }
 
@@ -355,3 +357,141 @@ class Engine:
         self.pending_s = {"stype": stype, "dir": d, "inf": inf, "index": i, "raw": raw_hex}
         step["action"] = f"{stype.lower()}-request"
         step["notes"].append(f"S({stype})请求，等待对向匹配应答")
+
+
+# ---------------------------------------------------------------------- #
+# 命令—应答往返配对（只读重放，不改变逐块裁决与冻结结果）
+# ---------------------------------------------------------------------- #
+def build_roundtrips(steps, apdu_hexes):
+    """按已确认的 I 块链边界生成维护站命令—读卡器应答对。
+
+    证据完全取自引擎已接受的步骤与组装出的完整 APDU：合法重传步骤动作是
+    retransmission（不参与边界），故重传只贡献一次 APDU；R/S 控制块（含
+    WTX、IFS 往返）穿插在命令结束与应答开始之间时原样列出，不改变配对。
+
+    配对规则（严格、不借用）：
+      - 逐条维护站(TX)命令 APDU 顺序消费读卡器(RX) APDU；
+      - RX APDU 必须完全落在下一条 TX 命令开始之前，否则命令标记未应答；
+      - 第一条 TX 命令开始前出现的 RX APDU、或应答窗口错位后多出来的 RX
+        APDU，记为无法归属，稳定指向首个，且不借给后续命令。
+    """
+    # 1. 按完成顺序抽取两侧完整 APDU 事件（chain-segment 记录首块，
+    #    apdu-complete 记录末块；同一步骤可同时为首末）。
+    events = {"TX": [], "RX": []}
+    first_by_dir = {}
+    for st in steps:
+        if st.get("kind") != "I":
+            continue
+        d = st["direction"]
+        if st.get("action") == "chain-segment":
+            first_by_dir[d] = st["index"]
+        elif st.get("action") == "apdu-complete":
+            events[d].append({
+                "first_index": first_by_dir.get(d, st["index"]),
+                "last_index": st["index"],
+            })
+            first_by_dir.pop(d, None)
+
+    for d in DIRECTIONS:
+        for k, ev in enumerate(events[d]):
+            ev["apdu"] = apdu_hexes[d][k]
+
+    # 2. 取命令/应答区间内穿插的控制块。
+    def _ctl(st):
+        return {
+            "index": st["index"],
+            "direction": st["direction"],
+            "kind": st["kind"],
+            "pcb": st.get("pcb"),
+            "detail": _control_detail(st),
+            "raw": st["raw"],
+        }
+
+    def controls_between(lo, hi=None):
+        """原始块序号落在 (lo, hi) 的 R/S 控制块；hi 为 None 时上界开放。"""
+        return [_ctl(st) for st in steps
+                if lo < st["index"] and (hi is None or st["index"] < hi)
+                and st.get("kind") in ("R", "S")]
+
+    def controls_before(hi):
+        return [_ctl(st) for st in steps
+                if st["index"] < hi and st.get("kind") in ("R", "S")]
+
+    # 3. 逐条命令配应答。
+    pairs = []
+    rx_i = 0
+    orphan = None
+    n_cmd = len(events["TX"])
+    for ci, cmd in enumerate(events["TX"]):
+        next_cmd_start = events["TX"][ci + 1]["first_index"] if ci + 1 < n_cmd else None
+        if rx_i < len(events["RX"]):
+            cand = events["RX"][rx_i]
+            if cand["first_index"] > cmd["last_index"] and (
+                next_cmd_start is None or cand["last_index"] < next_cmd_start
+            ):
+                rx_i += 1
+                pairs.append(_pair(len(pairs), cmd, cand,
+                                   controls_between(cmd["last_index"], cand["first_index"]),
+                                   "answered", None))
+                continue
+        # 窗口内无应答：候选 RX 若属于更早的错位窗口，保持未消费，绝不借用。
+        # 仍列出本应答窗口（命令结束→下条命令开始，或捕获结尾）内的 R/S 块。
+        window_end = next_cmd_start
+        pairs.append(_pair(len(pairs), cmd, None,
+                           controls_between(cmd["last_index"], window_end),
+                           "unanswered",
+                           "读卡器在下一条维护站命令开始前未完成应答"))
+
+    # 4. 首个无法归属的读卡器 APDU（读卡器先发或连续两个读卡器 APDU）。
+    if rx_i < len(events["RX"]):
+        first = events["RX"][rx_i]
+        orphan = {
+            "apdu": first["apdu"],
+            "first_index": first["first_index"],
+            "last_index": first["last_index"],
+            "reason": (
+                "读卡器在任何维护站命令之前先发出 APDU"
+                if n_cmd == 0 or first["last_index"] < events["TX"][0]["first_index"]
+                else "连续出现两个读卡器 APDU，该 APDU 无法归属到任何命令且不借给后续命令"
+            ),
+            "preceding_controls": controls_before(first["first_index"]),
+            "extra_count": len(events["RX"]) - rx_i,
+        }
+
+    return {
+        "pairs": pairs,
+        "orphan_response": orphan,
+        "command_count": n_cmd,
+        "answered_count": sum(1 for p in pairs if p["status"] == "answered"),
+        "unanswered_count": sum(1 for p in pairs if p["status"] == "unanswered"),
+    }
+
+
+def _control_detail(st):
+    if st["kind"] == "R":
+        code = st["rcode"]
+        name = R_CODES.get(code, str(code))
+        return f"R({name}) N(R)={st['nr']}"
+    return f"S({st['stype']}){'应答' if st.get('sresp') else '请求'}"
+
+
+def _pair(seq, cmd, resp, controls, status, note):
+    p = {
+        "seq": seq,
+        "status": status,
+        "command": {
+            "apdu": cmd["apdu"],
+            "first_index": cmd["first_index"],
+            "last_index": cmd["last_index"],
+        },
+        "response": None,
+        "between_controls": controls,
+        "note": note,
+    }
+    if resp is not None:
+        p["response"] = {
+            "apdu": resp["apdu"],
+            "first_index": resp["first_index"],
+            "last_index": resp["last_index"],
+        }
+    return p

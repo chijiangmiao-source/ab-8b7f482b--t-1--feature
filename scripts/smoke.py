@@ -112,6 +112,52 @@ def main():
           and err.get("index") == 2 and err.get("code") == "S_WAIT",
           f"status={st6} error={err}")
 
+    # 8b. 往返证据：合法重传捕获恰好 1 对，重传只贡献一次应答
+    rt = body.get("roundtrips") or {}
+    pairs = rt.get("pairs") or []
+    pair_ok = (rt.get("command_count") == 1 and rt.get("answered_count") == 1
+               and rt.get("unanswered_count") == 0 and rt.get("orphan_response") is None
+               and len(pairs) == 1 and pairs[0].get("status") == "answered"
+               and (pairs[0].get("response") or {}).get("apdu") == "6F0584039000"
+               and (pairs[0].get("command") or {}).get("first_index") == 0
+               and (pairs[0].get("command") or {}).get("last_index") == 2)
+    check("往返证据：链式命令配单一应答，首末块序号正确，重传不重复",
+          pair_ok, f"roundtrips={rt}")
+
+    # 8c. 往返证据：命令无应答 → 未应答
+    no_resp = [{"direction": "TX", "hex": blk(T, 0x00, "00A4040000")}]
+    st8, body8 = req("POST", "/api/audits", {"audit_id": RUN_ID + "-noresp", "blocks": no_resp})
+    rt8 = (body8 or {}).get("roundtrips") or {}
+    check("往返证据：命令未获应答 → unanswered",
+          st8 == 201 and rt8.get("unanswered_count") == 1
+          and rt8.get("pairs", [{}])[0].get("status") == "unanswered"
+          and rt8.get("pairs", [{}])[0].get("response") is None,
+          f"status={st8} roundtrips={rt8}")
+
+    # 8d. 往返证据：读卡器先发 APDU → 稳定标出首个无法归属 APDU
+    reader_first = [{"direction": "RX", "hex": blk(R, 0x00, "6E00")}]
+    st9, body9 = req("POST", "/api/audits", {"audit_id": RUN_ID + "-orphan", "blocks": reader_first})
+    rt9 = (body9 or {}).get("roundtrips") or {}
+    o = rt9.get("orphan_response") or {}
+    check("往返证据：读卡器先发 → 首个无法归属 APDU 被标出",
+          st9 == 201 and o.get("apdu") == "6E00"
+          and o.get("first_index") == 0 and o.get("last_index") == 0,
+          f"status={st9} roundtrips={rt9}")
+
+    # 8e. 往返证据：WTX 往返穿插在两侧 APDU 之间，不改变配对
+    wtx_ok = [
+        {"direction": "TX", "hex": blk(T, 0x00, "00A4040000")},
+        {"direction": "RX", "hex": blk(R, 0xC3, "05")},
+        {"direction": "TX", "hex": blk(T, 0xE3, "05")},
+        {"direction": "RX", "hex": blk(R, 0x00, "9000")},
+    ]
+    st10, body10 = req("POST", "/api/audits", {"audit_id": RUN_ID + "-wtxok", "blocks": wtx_ok})
+    p10 = ((body10 or {}).get("roundtrips") or {}).get("pairs", [{}])[0]
+    ctrls = [c.get("index") for c in (p10.get("between_controls") or [])]
+    check("往返证据：WTX 往返列于命令—应答间隙且仍已应答",
+          st10 == 201 and p10.get("status") == "answered" and ctrls == [1, 2],
+          f"status={st10} pair={p10}")
+
     # 9. 超过 64 块 → 400
     st7, _ = req("POST", "/api/audits",
                  {"audit_id": RUN_ID + "-65", "blocks": [{"direction": "TX", "hex": blk(T, 0x00, "00")}] * 65})
